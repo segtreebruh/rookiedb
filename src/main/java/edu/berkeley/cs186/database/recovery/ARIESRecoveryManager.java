@@ -737,7 +737,47 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     void restartRedo() {
         // TODO(proj5): implement
-        return;
+        Long beginLSN = null;
+
+        for (Long recLSN: dirtyPageTable.values()) {
+            if (beginLSN == null) beginLSN = recLSN;
+            else beginLSN = Math.min(beginLSN, recLSN);
+        }
+        if (beginLSN == null) return;
+
+        Iterator<LogRecord> iter = logManager.scanFrom(beginLSN);
+        while (iter.hasNext()) {
+            LogRecord currentRecord = iter.next();
+
+            if (!currentRecord.isRedoable()) continue;
+            switch (currentRecord.getType()) {
+                case ALLOC_PART:
+                case UNDO_ALLOC_PART:
+                case FREE_PART:
+                case UNDO_FREE_PART:
+                case ALLOC_PAGE:
+                case UNDO_FREE_PAGE:
+                    currentRecord.redo(this, diskSpaceManager, bufferManager);
+                    break;
+                case UPDATE_PAGE:
+                case UNDO_UPDATE_PAGE:
+                case UNDO_ALLOC_PAGE:
+                case FREE_PAGE:
+                    Long pageNum = currentRecord.getPageNum().get();
+                    Page page = bufferManager.fetchPage(new DummyLockContext(), pageNum);
+                    try {
+                        if (!dirtyPageTable.containsKey(pageNum)) break;
+                        if (!(currentRecord.getLSN() >= dirtyPageTable.get(pageNum))) break;
+                        if (!(page.getPageLSN() < currentRecord.getLSN())) break;
+
+                        currentRecord.redo(this, diskSpaceManager, bufferManager);
+                    } finally {
+                        page.unpin();
+                    }
+
+                    break;
+            }
+        }
     }
 
     /**
