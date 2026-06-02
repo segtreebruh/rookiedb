@@ -1482,6 +1482,140 @@ public class TestRecoveryManager {
         assertEquals(Collections.singletonMap(10000000002L, LSN2), dirtyPageTable);
     }
 
+    /**
+     * Tests that cleanup() is called correctly after analysis:
+     * - COMMITTING transaction (T1): cleanup() called, removed from table, status COMPLETE
+     * - RUNNING transaction (T2): NOT cleaned up, status RECOVERY_ABORTING (abort record written)
+     * - RECOVERY_ABORTING transaction (T3): NOT cleaned up
+     */
+    @Test
+    @Category(PublicTests.class)
+    public void testAnalysisTransactionCleanup() {
+        byte[] before = new byte[]{ (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
+        byte[] after  = new byte[]{ (byte) 0xBA, (byte) 0xAD, (byte) 0xF0, (byte) 0x0D };
+
+        DummyTransaction t1 = DummyTransaction.create(1L);
+        DummyTransaction t2 = DummyTransaction.create(2L);
+        DummyTransaction t3 = DummyTransaction.create(3L);
+
+        List<Long> LSNs = new ArrayList<>();
+        LSNs.add(logManager.appendToLog(new UpdatePageLogRecord(1L, 10000000001L, 0L, (short) 0, before, after)));
+        LSNs.add(logManager.appendToLog(new CommitTransactionLogRecord(1L, LSNs.get(0))));
+        LSNs.add(logManager.appendToLog(new UpdatePageLogRecord(2L, 10000000002L, 0L, (short) 0, before, after)));
+        LSNs.add(logManager.appendToLog(new UpdatePageLogRecord(3L, 10000000003L, 0L, (short) 0, before, after)));
+        LSNs.add(logManager.appendToLog(new AbortTransactionLogRecord(3L, LSNs.get(3))));
+
+        shutdownRecoveryManager(recoveryManager);
+        recoveryManager = loadRecoveryManager(testDir);
+        recoveryManager.restartAnalysis();
+
+        // T1 committed: cleaned up, complete, removed from table
+        assertFalse(transactionTable.containsKey(1L));
+        assertTrue(t1.cleanedUp);
+        assertEquals(Transaction.Status.COMPLETE, t1.getStatus());
+
+        // T2 was running: NOT cleaned up, now recovery aborting
+        assertTrue(transactionTable.containsKey(2L));
+        assertFalse(t2.cleanedUp);
+        assertEquals(Transaction.Status.RECOVERY_ABORTING, t2.getStatus());
+
+        // T3 was aborting: NOT cleaned up, remains recovery aborting
+        assertTrue(transactionTable.containsKey(3L));
+        assertFalse(t3.cleanedUp);
+        assertEquals(Transaction.Status.RECOVERY_ABORTING, t3.getStatus());
+    }
+
+    /**
+     * Tests that restartRedo() handles an empty dirty page table without error.
+     * No redo calls should be made.
+     */
+    @Test
+    @Category(PublicTests.class)
+    public void testRedoEmptyDPT() {
+        byte[] before = new byte[]{ (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
+        byte[] after  = new byte[]{ (byte) 0xBA, (byte) 0xAD, (byte) 0xF0, (byte) 0x0D };
+
+        DummyTransaction.create(1L);
+        logManager.appendToLog(new UpdatePageLogRecord(1L, 10000000001L, 0L, (short) 0, before, after));
+
+        shutdownRecoveryManager(recoveryManager);
+        recoveryManager = loadRecoveryManager(testDir);
+
+        // DPT is empty (not populated)
+        assertTrue(dirtyPageTable.isEmpty());
+
+        // redo with empty DPT should succeed and redo nothing
+        setupRedoChecks();
+        recoveryManager.restartRedo();
+        finishRedoChecks();
+    }
+
+    /**
+     * Tests that restartUndo() is a no-op when there are no RECOVERY_ABORTING transactions.
+     */
+    @Test
+    @Category(PublicTests.class)
+    public void testUndoNoAbortingTransactions() {
+        byte[] before = new byte[]{ (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
+        byte[] after  = new byte[]{ (byte) 0xBA, (byte) 0xAD, (byte) 0xF0, (byte) 0x0D };
+
+        DummyTransaction t1 = DummyTransaction.create(1L);
+
+        // T1 commits and ends — no aborting transactions left
+        logManager.appendToLog(new UpdatePageLogRecord(1L, 10000000001L, 0L, (short) 0, before, after));
+        long commitLSN = logManager.appendToLog(new CommitTransactionLogRecord(1L, 0L));
+        long endLSN = logManager.appendToLog(new EndTransactionLogRecord(1L, commitLSN));
+
+        shutdownRecoveryManager(recoveryManager);
+        recoveryManager = loadRecoveryManager(testDir);
+        recoveryManager.restartAnalysis();
+
+        // sanity: no aborting transactions after analysis
+        assertTrue(transactionTable.isEmpty());
+
+        // undo should be a no-op — no redo calls
+        setupRedoChecks();
+        recoveryManager.restartUndo();
+        finishRedoChecks();
+    }
+
+    /**
+     * Tests that restartUndo() correctly calls cleanup() on aborted transactions
+     * and removes them from the transaction table.
+     * T1 makes 2 updates then aborts. After undo, T1 should be cleaned up and gone.
+     */
+    @Test
+    @Category(PublicTests.class)
+    public void testUndoTransactionCleanup() {
+        byte[] before = new byte[]{ (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00 };
+        byte[] after  = new byte[]{ (byte) 0xBA, (byte) 0xAD, (byte) 0xF0, (byte) 0x0D };
+
+        DummyTransaction t1 = DummyTransaction.create(1L);
+
+        List<Long> LSNs = new ArrayList<>();
+        LSNs.add(logManager.appendToLog(new UpdatePageLogRecord(1L, 10000000001L, 0L, (short) 0, before, after)));
+        LSNs.add(logManager.appendToLog(new UpdatePageLogRecord(1L, 10000000002L, LSNs.get(0), (short) 0, before, after)));
+        LSNs.add(logManager.appendToLog(new AbortTransactionLogRecord(1L, LSNs.get(1))));
+
+        for (int i = 0; i < 2; i++)
+            logManager.fetchLogRecord(LSNs.get(i)).redo(recoveryManager, diskSpaceManager, bufferManager);
+
+        shutdownRecoveryManager(recoveryManager);
+        recoveryManager = loadRecoveryManager(testDir);
+
+        TransactionTableEntry entry = new TransactionTableEntry(t1);
+        entry.lastLSN = LSNs.get(2);
+        entry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+        transactionTable.put(1L, entry);
+
+        recoveryManager.restartUndo();
+
+        // T1 should be cleaned up, removed from table, status COMPLETE
+        assertTrue(t1.cleanedUp);
+        assertFalse(transactionTable.containsKey(1L));
+        assertEquals(Transaction.Status.COMPLETE, t1.getStatus());
+    }
+
     // Helpers /////////////////////////////////////////////////////////////////
 
     /**
