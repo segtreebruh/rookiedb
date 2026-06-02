@@ -1,6 +1,7 @@
 package edu.berkeley.cs186.database.recovery;
 
 import edu.berkeley.cs186.database.Transaction;
+import edu.berkeley.cs186.database.TransactionContext;
 import edu.berkeley.cs186.database.common.Pair;
 import edu.berkeley.cs186.database.concurrency.DummyLockContext;
 import edu.berkeley.cs186.database.io.DiskSpaceManager;
@@ -604,7 +605,122 @@ public class ARIESRecoveryManager implements RecoveryManager {
         // Set of transactions that have completed
         Set<Long> endedTransactions = new HashSet<>();
         // TODO(proj5): implement
-        return;
+
+        Iterator<LogRecord> iter = logManager.scanFrom(LSN);
+        while (iter.hasNext()) {
+            LogRecord currentRecord = iter.next();
+
+            // transaction
+            if (currentRecord.getTransNum().isPresent()) {
+                long txNum = currentRecord.getTransNum().get();
+                if (!transactionTable.containsKey(txNum))
+                    startTransaction(newTransaction.apply(txNum));
+
+                transactionTable.get(txNum).lastLSN = currentRecord.getLSN();
+
+
+                Transaction transaction = transactionTable.get(txNum).transaction;
+
+                // transaction status changes
+                switch (currentRecord.getType()) {
+                    case COMMIT_TRANSACTION:
+                        transaction.setStatus(Transaction.Status.COMMITTING);
+                        break;
+                    case ABORT_TRANSACTION:
+                        transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                        break;
+                    case END_TRANSACTION:
+                        transaction.cleanup();
+                        transaction.setStatus(Transaction.Status.COMPLETE);
+                        endedTransactions.add(txNum);
+                        transactionTable.remove(txNum);
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            // page operations
+            if (currentRecord.getPageNum().isPresent()) {
+                Long pageNum = currentRecord.getPageNum().get();
+
+                switch (currentRecord.getType()) {
+                    // update/undo-update: might dirty a page in memory
+                    case UPDATE_PAGE:
+                    case UNDO_UPDATE_PAGE:
+                        if (!dirtyPageTable.containsKey(pageNum))
+                            dirtyPageTable.put(pageNum, currentRecord.getLSN()); // set recLSN
+                        break;
+                    // fre/undo alloc page: flush change to disk (remove from dpt)
+                    case FREE_PAGE:
+                    case UNDO_ALLOC_PAGE:
+                        dirtyPageTable.remove(pageNum);
+                        break;
+                }
+            }
+
+            // end checkpoint
+            else if (currentRecord.getType() == LogType.END_CHECKPOINT) {
+                // pageNum -> recLSN
+                Map<Long, Long> chkptDPT = currentRecord.getDirtyPageTable();
+                // txNum -> <status, LSN>
+                Map<Long, Pair<Transaction.Status, Long>>
+                        chkptTxnTable = currentRecord.getTransactionTable();
+
+                // replace recLSN in memory with recLSN from checkpoint
+                for (Long pageNum: chkptDPT.keySet()) dirtyPageTable.put(pageNum, chkptDPT.get(pageNum));
+
+                // update transactions to checkpoint
+                for (Map.Entry<Long, Pair<Transaction.Status, Long>> entry : chkptTxnTable.entrySet()) {
+                    Long txNum = entry.getKey();
+                    Transaction.Status chkptStatus = entry.getValue().getFirst();
+                    long chkptLSN = entry.getValue().getSecond();
+
+                    if (endedTransactions.contains(txNum)) continue;
+
+                    if (!transactionTable.containsKey(txNum)) startTransaction(newTransaction.apply(txNum));
+                    transactionTable.get(txNum).lastLSN = Math.max(chkptLSN, transactionTable.get(txNum).lastLSN);
+
+                    Transaction tx = transactionTable.get(txNum).transaction;
+                    switch (chkptStatus) {
+                        case COMMITTING:
+                            if (tx.getStatus() == Transaction.Status.RUNNING)
+                                tx.setStatus(Transaction.Status.COMMITTING);
+                            break;
+                        case ABORTING:
+                            if (tx.getStatus() == Transaction.Status.RUNNING)
+                                tx.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                            break;
+                        case COMPLETE:
+                            // only abort/commit can complete
+                            if (tx.getStatus() != Transaction.Status.RUNNING)
+                                tx.setStatus(Transaction.Status.COMPLETE);
+                            break;
+                    }
+                }
+            }
+        }
+
+        for (Map.Entry<Long, TransactionTableEntry> entry : transactionTable.entrySet()) {
+            Long txNum = entry.getKey();
+            TransactionTableEntry txEntry = entry.getValue();
+            Transaction tx = txEntry.transaction;
+
+            switch (tx.getStatus()) {
+                case COMMITTING:
+                    tx.cleanup();
+                    tx.setStatus(Transaction.Status.COMPLETE);
+                    logManager.appendToLog(new EndTransactionLogRecord(txNum, txEntry.lastLSN));
+                    transactionTable.remove(txNum);
+                    break;
+                case RUNNING:
+                    tx.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                    txEntry.lastLSN = logManager.appendToLog(new AbortTransactionLogRecord(txNum, txEntry.lastLSN));
+                    break;
+                case RECOVERY_ABORTING:
+                    break;
+            }
+        }
     }
 
     /**
